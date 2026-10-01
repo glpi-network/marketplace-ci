@@ -1,0 +1,163 @@
+name: "Marketplace compatibility scan"
+
+on:
+  schedule:
+    - cron: "0 2 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  scan:
+    name: "Scan marketplace catalog (GLPI ${{ matrix.glpi-version }}, PHP ${{ matrix.php-version }}, ${{ matrix.db-image }})"
+    runs-on: "ubuntu-latest"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One cell per supported GLPI version (see plugin-ci-workflows generate-ci-matrix.yml); no `main` cell since no prebuilt image exists for it.
+          - glpi-version: "12.0.x"
+            php-version: "8.3"
+            db-image: "mysql:8.0"
+          - glpi-version: "11.0.x"
+            php-version: "8.2"
+            db-image: "mariadb:10.6"
+          - glpi-version: "10.0.x"
+            php-version: "8.5"
+            db-image: "mariadb:10.2"
+    env:
+      # Image defaults to `testing`, which silently redirects marketplace/tmp dirs to
+      # test fixtures (see Environment.php), making marketplace:download fake success.
+      GLPI_ENVIRONMENT_TYPE: "production"
+    container:
+      image: "ghcr.io/glpi-project/githubactions-glpi-apache:php-${{ matrix.php-version }}-glpi-${{ matrix.glpi-version }}"
+      options: >-
+        --volume ${{ github.workspace }}:/var/www/glpi/marketplace-ci:rw
+        --user github-actions-runner
+    services:
+      db:
+        image: "ghcr.io/glpi-project/githubactions-${{ matrix.db-image }}"
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: "glpi"
+        options: >-
+          --shm-size=1g
+    defaults:
+      run:
+        # Run as `www-data` to prevent rights issues on GLPI generated files.
+        shell: "sudo --set-home --user=www-data --preserve-env bash --noprofile --norc -eo pipefail {0}"
+        working-directory: "/var/www/glpi"
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@v7"
+
+      - name: "Install bz2 PHP extension"
+        # Not bundled in the image; without it marketplace:download fails on every plugin's .tar.bz2 archive.
+        # PHP_INI_DIR isn't reliably inherited from the image's Dockerfile ENV per-step, and sudo strips it unless preserved with -E.
+        env:
+          PHP_INI_DIR: "/usr/local/etc/php"
+        shell: "bash"
+        run: |
+          sudo -E docker-php-ext-install bz2
+
+      - name: "Install sqlsrv PHP extension"
+        # Needed by the "sccm" plugin; not bundled in the image. Mirrors pluginsGLPI/sccm's own CI init-script.sh.
+        env:
+          PHP_INI_DIR: "/usr/local/etc/php"
+        shell: "bash"
+        run: |
+          sudo apt-get update -yq
+          sudo apt-get install -yq unixodbc-dev
+          PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
+          if [[ "$PHP_VERSION" == "7.4" ]]; then
+            sudo pecl install sqlsrv-5.10.1
+          elif [[ "$PHP_VERSION" == "8.0" ]]; then
+            sudo pecl install sqlsrv-5.11.0
+          elif [[ "$PHP_VERSION" == "8.1" || "$PHP_VERSION" == "8.2" ]]; then
+            sudo pecl install sqlsrv-5.12.0
+          else
+            sudo pecl install sqlsrv
+          fi
+          echo "extension=sqlsrv.so" | sudo tee -a "$PHP_INI_DIR/php.ini"
+
+      - name: "Install GLPI database"
+        run: |
+          bin/console database:install --ansi --no-interaction --db-name=glpi --db-host=db --db-user=root --db-password="" --strict-configuration
+          bin/console config:set url_base "http://localhost"
+          bin/console config:set url_base_api "http://localhost/apirest.php"
+
+      - name: "Register GLPI Network key"
+        env:
+          GLPINETWORK_REGISTRATION_KEY: "${{ secrets.GLPINETWORK_REGISTRATION_KEY }}"
+        run: |
+          bin/console config:set glpinetwork_registration_key "$GLPINETWORK_REGISTRATION_KEY"
+
+      - name: "Run apache"
+        # Use default `bash` shell with `github-actions-runner` user
+        shell: "bash"
+        run: |
+          sudo service apache2 start
+
+      - name: "Configure marketplace cache directory"
+        # actions/cache runs as github-actions-runner, not www-data; without this chown
+        # it fails to restore/save the cache ("Cannot utime: Operation not permitted").
+        shell: "bash"
+        run: |
+          sudo mkdir --parents /var/www/glpi/marketplace
+          sudo chown --recursive github-actions-runner /var/www/glpi/marketplace
+
+      - name: "Restore marketplace plugins cache"
+        uses: "actions/cache@v6"
+        with:
+          path: "/var/www/glpi/marketplace"
+          key: "marketplace-${{ matrix.glpi-version }}-${{ github.run_number }}"
+          restore-keys: |
+            marketplace-${{ matrix.glpi-version }}-
+
+      - name: "Fix marketplace directory ACL"
+        # Restores `www-data` write access lost to the chown above, needed by the
+        # `marketplace:download`/`plugin:install` steps run as `www-data`.
+        shell: "bash"
+        run: |
+          sudo setfacl --recursive --modify u:www-data:rwx /var/www/glpi/marketplace
+
+      - name: "Diagnose marketplace setup (kept for future troubleshooting)"
+        # Sanity checks for issues already hit once: wrong GLPI_MARKETPLACE_DIR/GLPI_TMP_DIR
+        # resolution, missing PHP extensions, or an unreachable marketplace download URL.
+        run: |
+          echo "--- resolved GLPI paths after full app boot ---"
+          php -r '
+            chdir("/var/www/glpi");
+            register_shutdown_function(function () {
+                echo "GLPI_ENVIRONMENT_TYPE=" . (getenv("GLPI_ENVIRONMENT_TYPE") ?: "undef") . PHP_EOL;
+                echo "GLPI_MARKETPLACE_DIR=" . (defined("GLPI_MARKETPLACE_DIR") ? GLPI_MARKETPLACE_DIR : "undef") . PHP_EOL;
+                echo "GLPI_TMP_DIR=" . (defined("GLPI_TMP_DIR") ? GLPI_TMP_DIR : "undef") . PHP_EOL;
+            });
+            $_SERVER["argv"] = ["bin/console", "list", "--no-ansi"];
+            require "bin/console";
+          ' 2>&1 | grep -E "^GLPI_"
+          echo "--- GLPI requirements (bz2/Phar/zip extensions + marketplace dir write access) ---"
+          bin/console system:check_requirements --no-ansi --no-interaction || true
+          echo "--- sample plugin installation_url reachability ---"
+          INFO=$(php bin/console marketplace:info --no-ansi --no-interaction accounts || true)
+          URL=$(echo "$INFO" | grep -oP "'installation_url' => '\K[^']*" || true)
+          echo "installation_url: ${URL:-(none, plugin has no compatible version for this GLPI release)}"
+          if [[ -n "$URL" ]]; then
+            curl -sS -L -o /dev/null -w 'HTTP status: %{http_code} (final URL: %{url_effective})\n' "$URL" || true
+          fi
+
+      - name: "Run marketplace scan"
+        run: |
+          bash marketplace-ci/scripts/run-marketplace.sh marketplace-ci/config/priority-plugins.txt
+
+      - name: "Publish summary"
+        if: ${{ !cancelled() }}
+        shell: "bash"
+        run: |
+          cat /tmp/marketplace-report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: "Dump GLPI debug log"
+        # Download failures only print a generic message on stdout; the real Guzzle
+        # exception goes to this file via Toolbox::logDebug().
+        if: ${{ !cancelled() }}
+        run: |
+          echo "--- files/_log/php-errors.log (last 200 lines) ---"
+          tail -n 200 files/_log/php-errors.log || echo "(no php-errors.log)"
