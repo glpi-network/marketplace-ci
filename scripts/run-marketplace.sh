@@ -199,7 +199,7 @@ INCOMPATIBLE_COUNT=$(awk -F'\t' '$2 == "incompatible_version"' "$RESULTS_FILE" |
 ISSUES_COUNT=$(awk -F'\t' '$2 != "ok" && $2 != "incompatible_version"' "$RESULTS_FILE" | wc -l)
 
 {
-  echo "# Marketplace compatibility scan"
+  echo "# Marketplace compatibility scan (GLPI ${GLPI_VERSION:-unknown})"
   echo
   echo "| 🧪 Tested | ✅ OK | ⚠️ Issues | ⏭️ Not available for this GLPI version |"
   echo "|---|---|---|---|"
