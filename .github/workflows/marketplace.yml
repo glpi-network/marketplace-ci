@@ -85,7 +85,7 @@ jobs:
 
       - name: "Install GLPI database"
         run: |
-          bin/console database:install --ansi --no-interaction --db-name=glpi --db-host=db --db-user=root --db-password="" --strict-configuration
+          bin/console database:install --ansi --no-interaction --no-telemetry --db-name=glpi --db-host=db --db-user=root --db-password="" --strict-configuration
           bin/console config:set url_base "http://localhost"
           bin/console config:set url_base_api "http://localhost/apirest.php"
 
