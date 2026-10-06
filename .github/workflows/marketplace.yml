@@ -8,11 +8,48 @@ on:
 
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 jobs:
+  ensure-issue:
+    name: "Ensure tracking issue exists"
+    # Only non-PR runs (schedule/workflow_dispatch) post here; PR runs get a PR comment instead.
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: "ubuntu-latest"
+    outputs:
+      issue_number: "${{ steps.ensure.outputs.issue_number }}"
+    steps:
+      - name: "Find or create tracking issue"
+        id: ensure
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          REPO: "${{ github.repository }}"
+        run: |
+          gh label create marketplace-scan-tracker \
+            --repo "$REPO" \
+            --color "0E8A16" \
+            --description "Tracks the latest marketplace compatibility scan results" \
+            --force
+
+          NUMBER=$(gh issue list --repo "$REPO" --label marketplace-scan-tracker --state open --json number --jq '.[0].number')
+
+          if [[ -z "$NUMBER" ]]; then
+            URL=$(gh issue create --repo "$REPO" \
+              --title "Marketplace compatibility scan - latest results" \
+              --body "This issue tracks the latest marketplace compatibility scan results, one comment per GLPI version. Updated automatically by the *Marketplace compatibility scan* workflow." \
+              --label marketplace-scan-tracker)
+            NUMBER=$(echo "$URL" | grep -oP '\d+$')
+            gh issue pin "$NUMBER" --repo "$REPO" || true
+          fi
+
+          echo "issue_number=$NUMBER" >> "$GITHUB_OUTPUT"
+
   scan:
     name: "Scan marketplace catalog (GLPI ${{ matrix.glpi-version }}, PHP ${{ matrix.php-version }}, ${{ matrix.db-image }})"
+    needs: [ensure-issue]
+    # Run regardless of ensure-issue's outcome (even skipped on PR runs); only abort on cancellation.
+    if: ${{ !cancelled() }}
     runs-on: "ubuntu-latest"
     strategy:
       fail-fast: false
@@ -155,6 +192,24 @@ jobs:
         run: |
           bash marketplace-ci/scripts/run-marketplace.sh marketplace-ci/config/priority-plugins.txt
 
+      - name: "Append PHP error log to report"
+        # Download failures only print a generic message on stdout; the real Guzzle
+        # exception goes to this file via Toolbox::logDebug(). Collapsed by default:
+        # noise on success, needed on failure.
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo ""
+            echo "<details>"
+            echo "<summary>PHP error log (last 200 lines)</summary>"
+            echo ""
+            echo '```'
+            tail -n 200 files/_log/php-errors.log 2>/dev/null || echo "(no php-errors.log)"
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> /tmp/marketplace-report.md
+
       - name: "Publish summary"
         if: ${{ !cancelled() }}
         shell: "bash"
@@ -194,10 +249,35 @@ jobs:
               "$COMMENTS_API" -d "$BODY_JSON" > /dev/null
           fi
 
-      - name: "Dump GLPI debug log"
-        # Download failures only print a generic message on stdout; the real Guzzle
-        # exception goes to this file via Toolbox::logDebug().
-        if: ${{ !cancelled() }}
+      - name: "Post scan summary to tracking issue"
+        # One comment per GLPI version, identified by a marker and updated in place on re-runs.
+        # Uses curl directly: the GLPI container image doesn't ship the gh CLI.
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.ensure-issue.outputs.issue_number != '' }}
+        shell: "bash"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          REPO: "${{ github.repository }}"
+          ISSUE_NUMBER: "${{ needs.ensure-issue.outputs.issue_number }}"
+          MARKER: "<!-- marketplace-scan:${{ matrix.glpi-version }} -->"
         run: |
-          echo "--- files/_log/php-errors.log (last 200 lines) ---"
-          tail -n 200 files/_log/php-errors.log || echo "(no php-errors.log)"
+          command -v jq >/dev/null || { sudo apt-get update -yq && sudo apt-get install -yq jq; }
+
+          BODY_FILE=$(mktemp)
+          echo "$MARKER" > "$BODY_FILE"
+          cat /tmp/marketplace-report.md >> "$BODY_FILE" 2>/dev/null || echo "(scan did not produce a report)" >> "$BODY_FILE"
+
+          AUTH_HEADER="Authorization: Bearer $GH_TOKEN"
+          COMMENTS_API="https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments"
+
+          EXISTING_ID=$(curl -sS -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" "$COMMENTS_API?per_page=100" \
+            | jq -r --arg marker "$MARKER" '.[] | select(.body | startswith($marker)) | .id' | head -n1)
+
+          BODY_JSON=$(jq -Rs '{body: .}' "$BODY_FILE")
+
+          if [[ -n "$EXISTING_ID" ]]; then
+            curl -sS -X PATCH -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/comments/$EXISTING_ID" -d "$BODY_JSON" > /dev/null
+          else
+            curl -sS -X POST -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" \
+              "$COMMENTS_API" -d "$BODY_JSON" > /dev/null
+          fi
