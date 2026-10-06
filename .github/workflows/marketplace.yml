@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 2 * * 1-5"
   workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   scan:
@@ -80,7 +85,7 @@ jobs:
 
       - name: "Install GLPI database"
         run: |
-          bin/console database:install --ansi --no-interaction --db-name=glpi --db-host=db --db-user=root --db-password="" --strict-configuration
+          bin/console database:install --ansi --no-interaction --no-telemetry --db-name=glpi --db-host=db --db-user=root --db-password="" --strict-configuration
           bin/console config:set url_base "http://localhost"
           bin/console config:set url_base_api "http://localhost/apirest.php"
 
@@ -145,6 +150,8 @@ jobs:
           fi
 
       - name: "Run marketplace scan"
+        env:
+          GLPI_VERSION: "${{ matrix.glpi-version }}"
         run: |
           bash marketplace-ci/scripts/run-marketplace.sh marketplace-ci/config/priority-plugins.txt
 
@@ -153,6 +160,39 @@ jobs:
         shell: "bash"
         run: |
           cat /tmp/marketplace-report.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: "Post scan summary to PR"
+        # One comment per GLPI version, identified by a marker and updated in place on re-runs.
+        # Uses curl directly: the GLPI container image doesn't ship the gh CLI.
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        shell: "bash"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          REPO: "${{ github.repository }}"
+          PR_NUMBER: "${{ github.event.pull_request.number }}"
+          MARKER: "<!-- marketplace-scan:${{ matrix.glpi-version }} -->"
+        run: |
+          command -v jq >/dev/null || { sudo apt-get update -yq && sudo apt-get install -yq jq; }
+
+          BODY_FILE=$(mktemp)
+          echo "$MARKER" > "$BODY_FILE"
+          cat /tmp/marketplace-report.md >> "$BODY_FILE" 2>/dev/null || echo "(scan did not produce a report)" >> "$BODY_FILE"
+
+          AUTH_HEADER="Authorization: Bearer $GH_TOKEN"
+          COMMENTS_API="https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments"
+
+          EXISTING_ID=$(curl -sS -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" "$COMMENTS_API?per_page=100" \
+            | jq -r --arg marker "$MARKER" '.[] | select(.body | startswith($marker)) | .id' | head -n1)
+
+          BODY_JSON=$(jq -Rs '{body: .}' "$BODY_FILE")
+
+          if [[ -n "$EXISTING_ID" ]]; then
+            curl -sS -X PATCH -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/issues/comments/$EXISTING_ID" -d "$BODY_JSON" > /dev/null
+          else
+            curl -sS -X POST -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" \
+              "$COMMENTS_API" -d "$BODY_JSON" > /dev/null
+          fi
 
       - name: "Dump GLPI debug log"
         # Download failures only print a generic message on stdout; the real Guzzle

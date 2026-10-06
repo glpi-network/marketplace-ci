@@ -1,3 +1,5 @@
 # One plugin key per line, lines starting with # are ignored.
 # Listed plugins are installed and activated first, in this order;
 # the rest of the marketplace catalog follows, alphabetically.
+statecheck
+archisw
