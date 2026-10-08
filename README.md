@@ -17,6 +17,16 @@ plugins are combined. It does not re-test plugins in isolation, each already has
 
 `.github/workflows/marketplace.yml` runs this nightly and on demand, and publishes the report.
 
+## Testing a GLPI pull request
+
+Open a pull request on this repository (not meant to be merged) adding the GLPI PR diff under `patches/<glpi-version>/`, where `<glpi-version>` is a matrix cell (`10.0.x`, `11.0.x`, `12.0.x`):
+
+```bash
+mkdir -p patches/11.0.x
+curl -fsSL https://github.com/glpi-project/glpi/pull/12345.diff -o patches/11.0.x/glpi-12345.diff
+```
+
+Only the cells with a `patches/` directory run. Every `*.diff` is applied in alphabetical order on top of the release image before GLPI is installed, and the job stops if one does not apply.
 ## Local testing
 
 ```bash

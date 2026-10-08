@@ -45,26 +45,46 @@ jobs:
 
           echo "issue_number=$NUMBER" >> "$GITHUB_OUTPUT"
 
+  setup:
+    name: "Compute scan matrix"
+    runs-on: "ubuntu-latest"
+    outputs:
+      matrix: "${{ steps.matrix.outputs.matrix }}"
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@v7"
+
+      - name: "Compute matrix"
+        id: matrix
+        # Primary cell of GLPI core CI (ci.yml on each `<version>/bugfixes` branch); no `main` image.
+        # Restricted to `patches/<glpi-version>/` when present.
+        env:
+          ALL_CELLS: |
+            [
+              {"glpi-version": "12.0.x", "php-version": "8.5", "db-image": "mariadb:12.3"},
+              {"glpi-version": "11.0.x", "php-version": "8.5", "db-image": "mariadb:12.3"},
+              {"glpi-version": "10.0.x", "php-version": "8.5", "db-image": "mariadb:11.8"}
+            ]
+        run: |
+          PATCHED=$(find patches -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | jq -Rsc 'split("\n") | map(select(. != ""))')
+          MATRIX=$(jq -c --argjson patched "$PATCHED" \
+            'if ($patched | length) == 0 then . else map(select(.["glpi-version"] as $v | $patched | index($v))) end | {include: .}' \
+            <<< "$ALL_CELLS")
+          if [[ "$(jq '.include | length' <<< "$MATRIX")" -eq 0 ]]; then
+            echo "::error::No matrix cell matches patches/ directories ($PATCHED)"
+            exit 1
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
   scan:
     name: "Scan marketplace catalog (GLPI ${{ matrix.glpi-version }}, PHP ${{ matrix.php-version }}, ${{ matrix.db-image }})"
-    needs: [ensure-issue]
-    # Run regardless of ensure-issue's outcome (even skipped on PR runs); only abort on cancellation.
-    if: ${{ !cancelled() }}
+    needs: [ensure-issue, setup]
+    # Also runs when ensure-issue is skipped (PR runs).
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
     runs-on: "ubuntu-latest"
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # One cell per supported GLPI version (see plugin-ci-workflows generate-ci-matrix.yml); no `main` cell since no prebuilt image exists for it.
-          - glpi-version: "12.0.x"
-            php-version: "8.3"
-            db-image: "mysql:8.0"
-          - glpi-version: "11.0.x"
-            php-version: "8.2"
-            db-image: "mariadb:10.6"
-          - glpi-version: "10.0.x"
-            php-version: "8.5"
-            db-image: "mariadb:10.2"
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     env:
       # Image defaults to `testing`, which silently redirects marketplace/tmp dirs to
       # test fixtures (see Environment.php), making marketplace:download fake success.
@@ -110,15 +130,36 @@ jobs:
           sudo apt-get install -yq unixodbc-dev
           PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
           if [[ "$PHP_VERSION" == "7.4" ]]; then
-            sudo pecl install sqlsrv-5.10.1
+            PACKAGE="sqlsrv-5.10.1"
           elif [[ "$PHP_VERSION" == "8.0" ]]; then
-            sudo pecl install sqlsrv-5.11.0
+            PACKAGE="sqlsrv-5.11.0"
           elif [[ "$PHP_VERSION" == "8.1" || "$PHP_VERSION" == "8.2" ]]; then
-            sudo pecl install sqlsrv-5.12.0
+            PACKAGE="sqlsrv-5.12.0"
           else
-            sudo pecl install sqlsrv
+            PACKAGE="sqlsrv"
           fi
+          # pecl.php.net intermittently fails release lookups ("No releases available", "does not have REST xml available").
+          for attempt in 1 2 3; do
+            sudo pecl install "$PACKAGE" && break
+            [[ $attempt -eq 3 ]] && exit 1
+            echo "pecl install failed (attempt $attempt), retrying in 15s"
+            sleep 15
+          done
           echo "extension=sqlsrv.so" | sudo tee -a "$PHP_INI_DIR/php.ini"
+
+      - name: "Apply GLPI patches"
+        env:
+          PATCH_DIR: "marketplace-ci/patches/${{ matrix.glpi-version }}"
+        run: |
+          [[ -d "$PATCH_DIR" ]] || { echo "No patch for this GLPI version"; exit 0; }
+          shopt -s nullglob
+          PATCHES=("$PATCH_DIR"/*.diff)
+          [[ ${#PATCHES[@]} -gt 0 ]] || { echo "::error::$PATCH_DIR contains no .diff file"; exit 1; }
+          for patch in "${PATCHES[@]}"; do
+            echo "--- $patch"
+            git apply --check --verbose "$patch"
+            git apply "$patch"
+          done
 
       - name: "Install GLPI database"
         run: |
@@ -189,7 +230,10 @@ jobs:
       - name: "Run marketplace scan"
         env:
           GLPI_VERSION: "${{ matrix.glpi-version }}"
+          PATCH_DIR: "marketplace-ci/patches/${{ matrix.glpi-version }}"
         run: |
+          GLPI_PATCHES=$(find "$PATCH_DIR" -maxdepth 1 -name '*.diff' -printf '%f\n' 2>/dev/null | sort | paste -sd ',' | sed 's/,/, /g' || true)
+          export GLPI_PATCHES
           bash marketplace-ci/scripts/run-marketplace.sh marketplace-ci/config/priority-plugins.txt
 
       - name: "Append PHP error log to report"
@@ -197,7 +241,17 @@ jobs:
         # exception goes to this file via Toolbox::logDebug(). Collapsed by default:
         # noise on success, needed on failure.
         if: ${{ !cancelled() }}
+        env:
+          JOB_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
         run: |
+          # No report yet means the job failed before the scan ran.
+          if [[ ! -f /tmp/marketplace-report.md ]]; then
+            {
+              echo "# Marketplace compatibility scan (GLPI ${{ matrix.glpi-version }})"
+              echo ""
+              echo "❌ Job failed before the scan ran, see [job logs]($JOB_URL)."
+            } > /tmp/marketplace-report.md
+          fi
           {
             echo ""
             echo "<details>"
@@ -231,7 +285,7 @@ jobs:
 
           BODY_FILE=$(mktemp)
           echo "$MARKER" > "$BODY_FILE"
-          cat /tmp/marketplace-report.md >> "$BODY_FILE" 2>/dev/null || echo "(scan did not produce a report)" >> "$BODY_FILE"
+          cat /tmp/marketplace-report.md >> "$BODY_FILE"
 
           AUTH_HEADER="Authorization: Bearer $GH_TOKEN"
           COMMENTS_API="https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments"
@@ -264,7 +318,7 @@ jobs:
 
           BODY_FILE=$(mktemp)
           echo "$MARKER" > "$BODY_FILE"
-          cat /tmp/marketplace-report.md >> "$BODY_FILE" 2>/dev/null || echo "(scan did not produce a report)" >> "$BODY_FILE"
+          cat /tmp/marketplace-report.md >> "$BODY_FILE"
 
           AUTH_HEADER="Authorization: Bearer $GH_TOKEN"
           COMMENTS_API="https://api.github.com/repos/$REPO/issues/$ISSUE_NUMBER/comments"
