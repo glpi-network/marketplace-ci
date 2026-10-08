@@ -14,7 +14,7 @@ PRIORITY_FILE="${1:?Usage: run-marketplace.sh <priority-plugins-file>}"
 LOG_FILE="files/_log/php-errors.log"
 CATALOG_FILE="/tmp/marketplace-catalog.txt"
 ORDERED_FILE="/tmp/marketplace-order.txt"
-RESULTS_FILE="/tmp/marketplace-results.tsv"
+RESULTS_FILE="/tmp/marketplace-results.txt"
 REPORT_MD="/tmp/marketplace-report.md"
 REPORT_JSON="/tmp/marketplace-report.json"
 
@@ -88,7 +88,7 @@ record() {
   active_csv="${active_csv//,/, }"
   detail="${detail//$'\t'/ }"
   detail="${detail//$'\n'/ }"
-  printf '%s\t%s\t%s\t%s\n' "$key" "$status" "$detail" "$active_csv" >> "$RESULTS_FILE"
+  printf '%s\x1f%s\x1f%s\x1f%s\n' "$key" "$status" "$detail" "$active_csv" >> "$RESULTS_FILE"
 }
 
 # Versions already on disk (downloaded by a previous run, restored from cache),
@@ -123,7 +123,7 @@ while IFS= read -r key; do
   echo "::group::$key"
 
   if ! fetch_marketplace_info "$key"; then
-    record "$key" "incompatible_version" "No version available for this GLPI instance"
+    record "$key" "incompatible" ""
     echo "Plugin \"$key\" has no compatible version for this GLPI instance, skipping."
     echo "::endgroup::"
     continue
@@ -195,44 +195,50 @@ active_cell() {
   echo "<details><summary>$count active</summary>$active</details>"
 }
 
-INCOMPATIBLE_COUNT=$(awk -F'\t' '$2 == "incompatible_version"' "$RESULTS_FILE" | wc -l)
-ISSUES_COUNT=$(awk -F'\t' '$2 != "ok" && $2 != "incompatible_version"' "$RESULTS_FILE" | wc -l)
+status_icon() {
+  case "$1" in
+    ok) echo "✅" ;;
+    broke_core) echo "💥" ;;
+    incompatible) echo "⏭️" ;;
+    *) echo "❌" ;;
+  esac
+}
+
+INCOMPATIBLE_COUNT=$(awk -F'\x1f' '$2 == "incompatible"' "$RESULTS_FILE" | wc -l)
+ISSUES_COUNT=$(awk -F'\x1f' '$2 != "ok" && $2 != "incompatible"' "$RESULTS_FILE" | wc -l)
 
 {
-  echo "# Marketplace compatibility scan (GLPI ${GLPI_VERSION:-unknown})"
+  echo "# Marketplace compatibility scan (GLPI ${GLPI_VERSION:-unknown}${GLPI_PATCHES:+, patched})"
   echo
+  if [[ -n "${GLPI_PATCHES:-}" ]]; then
+    echo "> [!WARNING]"
+    echo "> GLPI core patched with: $GLPI_PATCHES. Results do not reflect the official release."
+    echo
+  fi
   echo "| 🧪 Tested | ✅ OK | ⚠️ Issues | ⏭️ Not available for this GLPI version |"
   echo "|---|---|---|---|"
   echo "| $(wc -l < "$ORDERED_FILE") | ${#ACTIVE_PLUGINS[@]} | $ISSUES_COUNT | $INCOMPATIBLE_COUNT |"
   echo
-  echo "**Status legend:** 💥 \`broke_core\` = plugin broke GLPI once combined with the others already active, the actionable signal this scan exists for &middot; ❌ \`install_failed\`/\`activate_failed\`/\`download_failed\` = plugin itself failed (bug, missing prerequisite, unmet system requirement), usually not a cross-plugin conflict &middot; ⏭️ \`incompatible_version\` = no version published for this GLPI release, expected noise."
+  echo "**Status legend:** 💥 \`broke_core\` = plugin broke GLPI once combined with the others already active, the actionable signal this scan exists for &middot; ❌ \`install_failed\`/\`activate_failed\`/\`download_failed\` = plugin itself failed (bug, missing prerequisite, unmet system requirement), usually not a cross-plugin conflict &middot; ⏭️ \`incompatible\` = no version published for this GLPI release, expected noise."
   echo
-  if [[ "$ISSUES_COUNT" -gt 0 ]]; then
-    echo "## ⚠️ Issues (actionable signal)"
-    echo
-    echo "| Plugin | Status | Detail | Active plugins at the time |"
-    echo "|---|---|---|---|"
-    while IFS=$'\t' read -r key status detail active; do
-      [[ "$status" == "ok" || "$status" == "incompatible_version" ]] && continue
-      # Escape pipes: raw '|' in detail would otherwise break the table row.
-      echo "| $key | $status | ${detail//|/\\|} | $(active_cell "$active") |"
-    done < "$RESULTS_FILE"
-    echo
-  fi
-  if [[ "$INCOMPATIBLE_COUNT" -gt 0 ]]; then
-    echo "<details><summary>⏭️ Not available for this GLPI version ($INCOMPATIBLE_COUNT, expected noise)</summary>"
-    echo
-    while IFS=$'\t' read -r key status _detail _active; do
-      [[ "$status" == "incompatible_version" ]] || continue
-      echo "- $key"
-    done < "$RESULTS_FILE"
-    echo
-    echo "</details>"
-  fi
+  echo "<details><summary>Details (scan order)</summary>"
+  echo
+  echo "| # | Plugin | Status | Detail | Active plugins at the time |"
+  echo "|---|---|---|---|---|"
+  n=0
+  while IFS=$'\x1f' read -r key status detail active; do
+    n=$((n + 1))
+    # Active plugins only matter as failure context; omitted elsewhere to keep rows short.
+    [[ "$status" == "ok" || "$status" == "incompatible" ]] && active=""
+    # Escape pipes: raw '|' in detail would otherwise break the table row.
+    echo "| $n | $key | $(status_icon "$status") \`$status\` | ${detail//|/\\|} | $(active_cell "$active") |"
+  done < "$RESULTS_FILE"
+  echo
+  echo "</details>"
 } > "$REPORT_MD"
 
 jq -R -s -c '
-  split("\n") | map(select(length > 0) | split("\t"))
+  split("\n") | map(select(length > 0) | split("\u001f"))
   | map({key: .[0], status: .[1], detail: .[2], active_plugins: ((.[3] // "") | split(",") | map(select(length > 0)))})
 ' "$RESULTS_FILE" > "$REPORT_JSON"
 
